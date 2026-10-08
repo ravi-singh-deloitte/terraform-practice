@@ -11,13 +11,13 @@ env:
   AWS_REGION: "us-east-1"
 
 permissions:
-  id-token: write       # required for OIDC auth to AWS
+  id-token: write
   contents: read
-  pull-requests: write  # required to post plan comments on PRs
+  pull-requests: write
 
 jobs:
 
-  # ── Plan: runs on every PR, covers both environments ────────────────────────
+  # ── PR: plan both envs and post output as PR comments ───────────────────────
   plan:
     if: github.event_name == 'pull_request'
     name: Plan (${{ matrix.environment }})
@@ -26,11 +26,9 @@ jobs:
       fail-fast: false
       matrix:
         environment: [dev, prod]
-
     defaults:
       run:
         working-directory: environments/${{ matrix.environment }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,13 +37,6 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Debug OIDC token claims
-        run: |
-          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          echo "--- OIDC token claims ---"
-          echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -75,7 +66,7 @@ jobs:
             const body = [
               `### ${icon} Terraform Plan — \`${{ matrix.environment }}\``,
               '```hcl',
-              plan.slice(0, 60000),   // GitHub comment limit guard
+              plan.slice(0, 60000),
               '```',
               `**Outcome:** \`${status}\``,
             ].join('\n');
@@ -90,17 +81,14 @@ jobs:
         if: steps.plan.outcome == 'failure'
         run: exit 1
 
-  # ── Apply Dev: runs on merge to main, deploys automatically ─────────────────
-  apply-dev:
+  # ── PUSH: plan dev, save artifact ────────────────────────────────────────────
+  plan-dev:
     if: github.event_name == 'push'
-    name: Apply (dev)
+    name: Plan (dev)
     runs-on: ubuntu-latest
-    environment: dev    # no protection rules — deploys automatically
-
     defaults:
       run:
         working-directory: environments/dev
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -109,13 +97,6 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Debug OIDC token claims
-        run: |
-          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          echo "--- OIDC token claims ---"
-          echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -126,21 +107,61 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
-      - name: Terraform Apply
-        run: terraform apply -auto-approve
+      - name: Terraform Plan
+        run: terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
 
-  # ── Apply Prod: waits for dev + manual approval before deploying ─────────────
-  apply-prod:
-    if: github.event_name == 'push'
-    name: Apply (prod)
-    needs: apply-dev
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-dev
+          path: |
+            environments/dev/tfplan
+            environments/dev/plan.txt
+
+  # ── Apply dev — pauses for approval, then applies the saved plan ─────────────
+  apply-dev:
+    needs: plan-dev
+    name: Apply (dev)
     runs-on: ubuntu-latest
-    environment: prod   # set required reviewers on this environment in GitHub settings
+    environment: dev    # add required reviewers here in GitHub Settings → Environments
+    defaults:
+      run:
+        working-directory: environments/dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dev
+          path: environments/dev
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  # ── Plan prod (runs after dev is applied) ────────────────────────────────────
+  plan-prod:
+    needs: apply-dev
+    name: Plan (prod)
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: environments/prod
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,13 +170,6 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Debug OIDC token claims
-        run: |
-          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          echo "--- OIDC token claims ---"
-          echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -166,5 +180,49 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      - name: Terraform Plan
+        run: terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-prod
+          path: |
+            environments/prod/tfplan
+            environments/prod/plan.txt
+
+  # ── Apply prod — pauses for approval, then applies the saved plan ─────────────
+  apply-prod:
+    needs: plan-prod
+    name: Apply (prod)
+    runs-on: ubuntu-latest
+    environment: prod   # add required reviewers here in GitHub Settings → Environments
+    defaults:
+      run:
+        working-directory: environments/prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-prod
+          path: environments/prod
+
+      - name: Terraform Init
+        run: terraform init
+
       - name: Terraform Apply
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve tfplan
