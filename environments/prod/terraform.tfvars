@@ -1,0 +1,6 @@
+ami_id              = "ami-0c02fb55956c7d316"
+instance_type       = "t2.micro"
+instance_name       = "prod-ec2"
+vpc_cidr            = "10.1.0.0/16"
+private_subnet_cidr = "10.1.1.0/24"
+availability_zone   = "us-east-1b"

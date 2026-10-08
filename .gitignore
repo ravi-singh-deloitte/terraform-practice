@@ -1,0 +1,22 @@
+# Terraform state — never commit, contains secrets and resource IDs
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.tfstate
+
+# Plan output files — can contain sensitive resource details
+plan.txt
+*.tfplan
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files (local developer overrides, not for version control)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Sensitive variable files — use secrets manager or CI secrets instead
+*.auto.tfvars
